@@ -48,13 +48,13 @@ class IncomeModelConfig:
     variable_pay_inclusion: float = 0.25  # include this fraction of variable pay (0..1)
 
     # --- Level shift detection ---
-    shift_min_pre_months: int = 4
-    shift_min_post_months: int = 3
-    shift_max_pre_months: int = 10
-    shift_score_min: float = 2.0  # |post_median - pre_median| / max(IQR_all, eps)
+    # Stakeholder-friendly approach:
+    # Compare "recent typical salary" (median of last N months) vs "earlier typical salary"
+    # (median of the other 12-N months). Choose the N with the largest change from the
+    # allowed options below.
+    shift_post_window_months_options: tuple[int, ...] = (3, 6)
     shift_abs_min: float = 200.0  # require material absolute change
-    shift_post_cv_max: float = 0.20  # post-shift months should be reasonably stable
-    shift_full_weight_post_months: int = 6  # post_len >= this => full weight on post segment
+    shift_rel_min: float = 0.10  # and at least 10% change vs earlier median
 
 
 @dataclass(frozen=True)
@@ -75,11 +75,13 @@ class IncomeModelStats:
     median_prev9: float
     shift_abs_last3_prev9: float
 
-    # Level-shift detection best candidate
-    best_shift_score: float
-    best_shift_split: Optional[int]  # split index: pre = s[:split], post = s[split:]
-    best_shift_pre_median: Optional[float]
-    best_shift_post_median: Optional[float]
+    # Level-shift detection (chosen window from config options)
+    shift_abs_change: float
+    shift_rel_change: float
+    shift_split: Optional[int]  # split index: pre = s[:split], post = s[split:]
+    shift_post_window_months: Optional[int]
+    shift_pre_median: Optional[float]
+    shift_post_median: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -145,48 +147,48 @@ def _cv(values: Sequence[float], eps: float = 1e-9) -> float:
 def _detect_level_shift(
     s: Sequence[float],
     cfg: IncomeModelConfig,
-) -> tuple[bool, float, Optional[int], Optional[float], Optional[float]]:
+) -> tuple[bool, float, float, Optional[int], Optional[float], Optional[float], Optional[int]]:
     """
     Returns:
-      (shift_detected, best_score, best_split, pre_median, post_median)
-    """
-    iqr_all = _iqr(s)
-    denom = max(iqr_all, 1e-9)
+      (shift_detected, abs_change, rel_change, split, pre_median, post_median, post_window_months)
 
-    best_score = 0.0
+    Simplified logic:
+    - Try a small set of "recent window" sizes (e.g., last 3 months, last 6 months)
+    - For each, compare median(recent) vs median(earlier)
+    - Pick the window with the largest absolute change
+    - Detect a shift if the change is large both in absolute and relative terms
+    """
+    eps = 1e-9
+
+    best_abs = 0.0
+    best_rel = 0.0
     best_split: Optional[int] = None
     best_pre_m: Optional[float] = None
     best_post_m: Optional[float] = None
+    best_post_window: Optional[int] = None
 
-    max_pre_len = min(cfg.shift_max_pre_months, len(s) - cfg.shift_min_post_months)
-    for pre_len in range(cfg.shift_min_pre_months, max_pre_len + 1):
-        post_len = len(s) - pre_len
-        if post_len < cfg.shift_min_post_months:
+    for post_window in cfg.shift_post_window_months_options:
+        if post_window <= 0 or post_window >= len(s):
             continue
+        split = len(s) - post_window
+        pre = list(s[:split])
+        post = list(s[split:])
 
-        pre = list(s[:pre_len])
-        post = list(s[pre_len:])
         pre_m = _median(pre)
         post_m = _median(post)
-        shift_abs = abs(post_m - pre_m)
-        score = shift_abs / denom
+        abs_change = float(abs(post_m - pre_m))
+        rel_change = float(abs_change / max(abs(pre_m), eps))
 
-        # Post segment should be reasonably stable; otherwise likely variable pay.
-        if _cv(post) > cfg.shift_post_cv_max:
-            continue
-
-        if score > best_score:
-            best_score = float(score)
-            best_split = pre_len
+        if abs_change > best_abs:
+            best_abs = abs_change
+            best_rel = rel_change
+            best_split = split
             best_pre_m = float(pre_m)
             best_post_m = float(post_m)
+            best_post_window = int(post_window)
 
-    shift_detected = False
-    if best_split is not None and best_pre_m is not None and best_post_m is not None:
-        shift_abs_best = abs(best_post_m - best_pre_m)
-        shift_detected = (best_score >= cfg.shift_score_min) and (shift_abs_best >= cfg.shift_abs_min)
-
-    return shift_detected, float(best_score), best_split, best_pre_m, best_post_m
+    shift_detected = (best_split is not None) and (best_abs >= cfg.shift_abs_min) and (best_rel >= cfg.shift_rel_min)
+    return shift_detected, float(best_abs), float(best_rel), best_split, best_pre_m, best_post_m, best_post_window
 
 
 def model_income_last_12_months(
@@ -232,7 +234,15 @@ def model_income_last_12_months(
     shift_abs_last3_prev9 = float(abs(median_last3 - median_prev9))
 
     # --- Logic 2: level shift detection ---
-    shift_detected, best_shift_score, best_shift_split, best_pre_m, best_post_m = _detect_level_shift(s, cfg)
+    (
+        shift_detected,
+        shift_abs_change,
+        shift_rel_change,
+        shift_split,
+        shift_pre_median,
+        shift_post_median,
+        shift_post_window_months,
+    ) = _detect_level_shift(s, cfg)
 
     # --- Logic 3: variable salary detection ---
     variable_trigger = (
@@ -252,10 +262,12 @@ def model_income_last_12_months(
         median_last3=float(median_last3),
         median_prev9=float(median_prev9),
         shift_abs_last3_prev9=float(shift_abs_last3_prev9),
-        best_shift_score=float(best_shift_score),
-        best_shift_split=best_shift_split,
-        best_shift_pre_median=best_pre_m,
-        best_shift_post_median=best_post_m,
+        shift_abs_change=float(shift_abs_change),
+        shift_rel_change=float(shift_rel_change),
+        shift_split=shift_split,
+        shift_post_window_months=shift_post_window_months,
+        shift_pre_median=shift_pre_median,
+        shift_post_median=shift_post_median,
     )
 
     # --- Choose segment + estimate salary ---
@@ -287,24 +299,16 @@ def model_income_last_12_months(
         estimated_salary = float(base + included_variable_pay)
         reason_codes.append("salary_estimated_as_base_plus_haircutted_variable_pay")
 
-    elif shift_detected and best_shift_split is not None:
+    elif shift_detected and shift_split is not None and shift_post_median is not None:
         segment = SEG_LEVEL_SHIFT
         route = ROUTE_STANDARD
-        post_len = 12 - best_shift_split
+        post_len = 12 - shift_split
         confidence = "high" if post_len >= 4 else "medium"
         reason_codes.append("salary_level_shift_detected")
-
-        pre = list(s[:best_shift_split])
-        post = list(s[best_shift_split:])
-        pre_m = _median(pre)
-        post_m = _median(post)
-
-        w = min(1.0, post_len / max(cfg.shift_full_weight_post_months, 1))
-        estimated_salary = float(w * post_m + (1.0 - w) * pre_m)
-        if w < 1.0:
-            reason_codes.append("salary_estimate_blended_due_to_short_post_shift_window")
-        else:
-            reason_codes.append("salary_estimated_from_post_shift_months")
+        if shift_post_window_months is not None:
+            reason_codes.append(f"shift_window_months_{shift_post_window_months}")
+        estimated_salary = float(shift_post_median)
+        reason_codes.append("salary_estimated_as_recent_window_median")
 
     else:
         segment = SEG_BASELINE_MEAN_12M

@@ -1,13 +1,20 @@
 """
 Tolerance-band decisioning for declared vs modeled disposable income.
-
-Compliance-friendly implementation notes:
-- Uses absolute + relative tolerance bands.
-- Does NOT attempt to detect or infer applicant rounding behavior.
-
 Outputs:
 - decision_outcome: "yes" (auto) or "maybe" (refer)
 - di_for_limit: DI used for customer-facing max loan limit (with a capped uplift)
+
+
+## Strategy A — Simple, robust rule-based tolerance bands (recommended starting point)
+Define a “minor difference” tolerance that scales with magnitude (tolerating typical self-report noise without relying on source-specific heuristics).
+
+### A1) Tolerance-band consistency check: `minor_tol = max(abs_floor, rel_floor * scale)`
+Where:
+
+- `abs_floor` protects low-income cases (e.g., 50–200 currency units)
+- `rel_floor` protects high-income cases (e.g., 2%–10%)
+- `scale = max(abs(declared_di), abs(modeled_di))`
+
 """
 
 from __future__ import annotations
@@ -96,9 +103,11 @@ def decide_disposable_income_tolerance_bands(
     if minor:
         decision = "yes"
         reason_codes.append("diff_within_minor_tolerance")
+
     elif declared_significantly_higher:
         decision = "maybe"
         reason_codes.append("declared_significantly_higher_than_modeled")
+
     else:
         decision = "yes"
         reason_codes.append("declared_not_significantly_higher_than_modeled")
@@ -107,6 +116,7 @@ def decide_disposable_income_tolerance_bands(
         if declared_di >= modeled_di:
             di_for_limit = min(declared_di, modeled_di + minor_tol)
             reason_codes.append("uplift_capped_by_minor_tolerance")
+
         else:
             di_for_limit = declared_di
             reason_codes.append("declared_lower_is_conservative")

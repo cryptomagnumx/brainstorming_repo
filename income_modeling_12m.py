@@ -235,7 +235,7 @@ def estimate_salary_special_cases_12m(  # noqa: N802 (Polars UDF name kept as re
     *,
     cfg: IncomeModelConfig = IncomeModelConfig(),
     salary_col: str = "net_salary",
-    order_col: Optional[str] = None,
+    order_col: Optional[str] = "yearmonth",
 ):
     """
     Group UDF for Polars `map_groups`.
@@ -254,7 +254,8 @@ def estimate_salary_special_cases_12m(  # noqa: N802 (Polars UDF name kept as re
     Notes:
     - If the group does not have 12 usable salary values, both sub-models return (None, False).
     - If `order_col` is provided (and exists), the group is sorted by it before extracting salaries.
-      If not provided, we auto-sort by a common time column name if present.
+      By default, `order_col="yearmonth"` (YYYYMM).
+      If not provided / not present, we auto-sort by a common time column name if present.
     """
     import importlib
 
@@ -275,6 +276,9 @@ def estimate_salary_special_cases_12m(  # noqa: N802 (Polars UDF name kept as re
     else:
         # Best-effort auto-detect.
         auto_order_candidates = (
+            "yearmonth",  # YYYYMM
+            "yyyymm",
+            "year_month",
             "month_index",
             "month_idx",
             "month",

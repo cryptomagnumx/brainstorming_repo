@@ -20,9 +20,6 @@ SEG_BASELINE_MEAN_12M = "baseline_mean_12m"
 SEG_LEVEL_SHIFT = "recent_level_shift"
 SEG_VARIABLE = "variable_salary_bonus"
 
-ROUTE_STANDARD = "standard"
-ROUTE_VARIABLE_INCOME = "variable_income_process"
-
 
 @dataclass(frozen=True)
 class MonthIncome:
@@ -87,7 +84,6 @@ class IncomeModelStats:
 @dataclass(frozen=True)
 class IncomeModelResult:
     income_segment: str  # one of SEG_*
-    processing_route: str  # ROUTE_STANDARD or ROUTE_VARIABLE_INCOME
     confidence: str  # "high" | "medium"
     reason_codes: tuple[str, ...]
 
@@ -142,6 +138,103 @@ def _cv(values: Sequence[float], eps: float = 1e-9) -> float:
     mu = fmean(values)
     sigma = pstdev(values)
     return float(sigma / max(abs(mu), eps))
+
+
+@dataclass(frozen=True)
+class VariableSalaryEstimate:
+    """
+    Explainable estimate for variable/bonus-like salary.
+
+    - base_salary: median of "typical" months (q25..q75)
+    - included_variable_pay: haircutted average spike excess above base
+    - estimated_salary: base + included_variable_pay
+    """
+
+    estimated_salary: float
+    base_salary: float
+    included_variable_pay: float
+    reason_codes: tuple[str, ...]
+
+
+def detect_variable_salary_bonus(
+    net_salary_12: Sequence[float],
+    *,
+    cfg: IncomeModelConfig = IncomeModelConfig(),
+) -> bool:
+    """
+    Functional variable-salary detection. Suitable for use as a Polars UDF.
+    """
+    if len(net_salary_12) != 12:
+        raise ValueError(f"Expected net_salary_12 length 12, got {len(net_salary_12)}")
+    s = [float(x) for x in net_salary_12]
+    for i, sv in enumerate(s):
+        _require_finite(f"net_salary_12[{i}]", sv)
+
+    median_salary = _median(s)
+    iqr_salary = _iqr(s)
+    cv_salary = _cv(s)
+
+    if iqr_salary > 0:
+        spike_threshold = median_salary + cfg.spike_k_iqr * iqr_salary
+        low_threshold = median_salary - cfg.low_k_iqr * iqr_salary
+    else:
+        spike_threshold = median_salary * (1.0 + cfg.spike_rel_when_iqr_zero)
+        low_threshold = median_salary * (1.0 - cfg.low_rel_when_iqr_zero)
+
+    spike_count = int(sum(1 for sv in s if sv > spike_threshold))
+    low_count = int(sum(1 for sv in s if sv < low_threshold))
+
+    return bool(
+        (cv_salary >= cfg.variable_cv_min)
+        or (spike_count >= cfg.spike_months_min)
+        or ((spike_count >= cfg.bimodal_spike_min) and (low_count >= cfg.bimodal_low_min))
+    )
+
+
+def estimate_variable_salary_bonus(
+    net_salary_12: Sequence[float],
+    *,
+    cfg: IncomeModelConfig = IncomeModelConfig(),
+) -> VariableSalaryEstimate:
+    """
+    Functional variable-salary estimation. Suitable for use as a Polars UDF.
+    """
+    if len(net_salary_12) != 12:
+        raise ValueError(f"Expected net_salary_12 length 12, got {len(net_salary_12)}")
+    s = [float(x) for x in net_salary_12]
+    for i, sv in enumerate(s):
+        _require_finite(f"net_salary_12[{i}]", sv)
+
+    median_salary = _median(s)
+    iqr_salary = _iqr(s)
+
+    # Threshold to define "spike months"
+    if iqr_salary > 0:
+        spike_threshold = median_salary + cfg.spike_k_iqr * iqr_salary
+    else:
+        spike_threshold = median_salary * (1.0 + cfg.spike_rel_when_iqr_zero)
+
+    # Base salary from typical range (q25..q75).
+    q25 = _percentile(s, 0.25)
+    q75 = _percentile(s, 0.75)
+    typical = [sv for sv in s if q25 <= sv <= q75]
+    base = float(_median(typical) if typical else _median(s))
+
+    # Variable pay component: average spike excess above base, then apply haircut.
+    spike_excesses = [max(0.0, sv - base) for sv in s if sv > spike_threshold]
+    avg_excess = float(fmean(spike_excesses) if spike_excesses else 0.0)
+    included_variable = float(cfg.variable_pay_inclusion * avg_excess)
+    estimated = float(base + included_variable)
+
+    return VariableSalaryEstimate(
+        estimated_salary=estimated,
+        base_salary=base,
+        included_variable_pay=included_variable,
+        reason_codes=(
+            "salary_decomposed_into_base_plus_variable_component",
+            "variable_component_included_with_haircut",
+        ),
+    )
 
 
 def _detect_level_shift(
@@ -245,7 +338,7 @@ def model_income_last_12_months(
     ) = _detect_level_shift(s, cfg)
 
     # --- Logic 3: variable salary detection ---
-    variable_trigger = (
+    variable_trigger = bool(
         (cv_salary >= cfg.variable_cv_min)
         or (spike_count >= cfg.spike_months_min)
         or ((spike_count >= cfg.bimodal_spike_min) and (low_count >= cfg.bimodal_low_min))
@@ -277,31 +370,18 @@ def model_income_last_12_months(
 
     if variable_trigger:
         segment = SEG_VARIABLE
-        route = ROUTE_VARIABLE_INCOME
         confidence = "medium"
         reason_codes.append("salary_high_variability_detected")
         if spike_count >= cfg.spike_months_min:
             reason_codes.append("salary_spike_pattern")
-
-        # Base salary from typical range (q25..q75)
-        q25 = _percentile(s, 0.25)
-        q75 = _percentile(s, 0.75)
-        typical = [sv for sv in s if q25 <= sv <= q75]
-        base = _median(typical) if typical else _median(s)
-        base_salary_estimate = float(base)
-
-        # Variable pay: average spike excess above base, then apply haircut.
-        spike_value = spike_threshold
-        spike_excesses = [max(0.0, sv - base) for sv in s if sv > spike_value]
-        avg_excess = fmean(spike_excesses) if spike_excesses else 0.0
-
-        included_variable_pay = float(cfg.variable_pay_inclusion * avg_excess)
-        estimated_salary = float(base + included_variable_pay)
+        var_est = estimate_variable_salary_bonus(s, cfg=cfg)
+        base_salary_estimate = float(var_est.base_salary)
+        included_variable_pay = float(var_est.included_variable_pay)
+        estimated_salary = float(var_est.estimated_salary)
         reason_codes.append("salary_estimated_as_base_plus_haircutted_variable_pay")
 
     elif shift_detected and shift_split is not None and shift_post_median is not None:
         segment = SEG_LEVEL_SHIFT
-        route = ROUTE_STANDARD
         post_len = 12 - shift_split
         confidence = "high" if post_len >= 4 else "medium"
         reason_codes.append("salary_level_shift_detected")
@@ -312,7 +392,6 @@ def model_income_last_12_months(
 
     else:
         segment = SEG_BASELINE_MEAN_12M
-        route = ROUTE_STANDARD
         confidence = "medium"
         estimated_salary = float(mean_salary_12m)
         reason_codes.append("salary_estimated_by_mean_12m")
@@ -324,7 +403,6 @@ def model_income_last_12_months(
 
     return IncomeModelResult(
         income_segment=segment,
-        processing_route=route,
         confidence=confidence,
         reason_codes=tuple(reason_codes),
         estimated_monthly_salary=float(estimated_salary),

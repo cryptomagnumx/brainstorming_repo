@@ -22,7 +22,7 @@ For each case produce:
 - **decision_outcome**: `"yes"` or `"maybe"` (you can add `"no"` later if needed).
 - **di_for_limit**: the DI value used for max loan amount calculation (could be declared, modeled, or a fused/capped value).
 - **reason_codes**: list of strings explaining why (for auditability, monitoring, and tuning).
-- **metrics**: diff features (abs/relative/log-ratio), rounding signals, etc.
+- **metrics**: diff features (abs/relative/log-ratio), consistency signals, etc.
 
 ---
 
@@ -50,11 +50,6 @@ Given `declared_di` and `modeled_di`:
 - **log_ratio**: `log(max(declared_di, eps) / max(modeled_di, eps))` (more stable across scales)
 - **sign**: is declared higher than modeled?
 
-Rounding indicators:
-
-- **declared_step_guess**: inferred rounding step (e.g., 1/10/100/1000) for declared DI
-- **declared_is_rounded(step)**: declared DI is close to a multiple of `step`
-
 Model uncertainty (if available):
 
 - **modeled_sigma**: estimated model std or prediction interval width
@@ -69,20 +64,14 @@ Optional (very useful if you have them):
 ---
 
 ## Strategy A — Simple, robust rule-based tolerance bands (recommended starting point)
-Define a “minor difference” tolerance that scales with magnitude and recognizes rounding.
+Define a “minor difference” tolerance that scales with magnitude (tolerating typical self-report noise without relying on source-specific heuristics).
 
-### A1) Adaptive tolerance: `minor_tol = max(abs_floor, rel_floor * scale, rounding_allowance)`
+### A1) Tolerance-band consistency check: `minor_tol = max(abs_floor, rel_floor * scale)`
 Where:
 
 - `abs_floor` protects low-income cases (e.g., 50–200 currency units)
 - `rel_floor` protects high-income cases (e.g., 2%–10%)
 - `scale = max(abs(declared_di), abs(modeled_di))`
-- `rounding_allowance` lets you forgive rounding-like differences
-
-Rounding allowance idea:
-
-- infer declared rounding step (often 100 or 1000)
-- allow about **half the step** (or slightly more if DI is derived from multiple rounded components)
 
 ### A2) Decision rule
 - If `abs_diff_mag <= minor_tol`: **YES**
@@ -160,7 +149,7 @@ This is how you make it “optimal” in a measurable sense:
 Whatever strategy you start with, bake in:
 
 - **reason codes** (diff too large, declared>modeled, low modeled, etc.)
-- **metrics logs** (abs/rel diff, rounding step, sigma, z-score)
+- **metrics logs** (abs/rel diff, sigma, z-score)
 - **A/B testing** for “uplift cap” policy (customer conversion vs loss)
 
 ---
@@ -172,7 +161,7 @@ Below is a compact structure you can implement immediately, then calibrate thres
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite, log
+from math import isfinite
 from typing import Optional
 
 
@@ -185,10 +174,6 @@ class DecisionConfig:
     # Referral thresholds (extra guardrails)
     abs_referral: float = 800.0       # currency units
     rel_referral: float = 0.25        # 25%
-
-    # Rounding inference
-    rounding_steps: tuple[float, ...] = (1000.0, 500.0, 100.0, 50.0, 10.0)
-    rounding_close_frac: float = 0.05 # within 5% of step from a multiple
 
     # Uncertainty-aware knobs (if modeled_sigma provided)
     z_yes: float = 2.0
@@ -204,7 +189,6 @@ class DecisionResult:
     abs_diff: float
     rel_diff: float
     minor_tol: float
-    rounding_step: Optional[float]
     z_score: Optional[float]
 
 
@@ -212,27 +196,9 @@ def _is_valid_number(x: Optional[float]) -> bool:
     return x is not None and isfinite(x)
 
 
-def infer_rounding_step(value: float, steps: tuple[float, ...], close_frac: float) -> Optional[float]:
-    """
-    Return the largest step that value appears rounded to (approx).
-    Example: 3200 -> 100; 5000 -> 1000; 1234 -> None.
-    """
-    v = abs(value)
-    for step in steps:
-        if step <= 0:
-            continue
-        nearest = round(v / step) * step
-        if abs(v - nearest) <= (close_frac * step):
-            return step
-    return None
-
-
-def compute_minor_tolerance(declared_di: float, modeled_di: float, rounding_step: Optional[float], cfg: DecisionConfig) -> float:
+def compute_minor_tolerance(declared_di: float, modeled_di: float, cfg: DecisionConfig) -> float:
     scale = max(abs(declared_di), abs(modeled_di))
     tol = max(cfg.abs_floor, cfg.rel_floor * scale)
-    if rounding_step is not None:
-        # Half-step is a good first approximation; increase if DI aggregates many rounded components.
-        tol = max(tol, 0.5 * rounding_step)
     return tol
 
 
@@ -250,8 +216,7 @@ def decide_disposable_income(
     abs_diff = declared_di - modeled_di_mean
     rel_diff = abs_diff / max(abs(modeled_di_mean), eps)
 
-    rounding_step = infer_rounding_step(declared_di, cfg.rounding_steps, cfg.rounding_close_frac)
-    minor_tol = compute_minor_tolerance(declared_di, modeled_di_mean, rounding_step, cfg)
+    minor_tol = compute_minor_tolerance(declared_di, modeled_di_mean, cfg)
 
     z_score: Optional[float] = None
     if _is_valid_number(modeled_di_sigma) and modeled_di_sigma > 0:
@@ -305,7 +270,6 @@ def decide_disposable_income(
         abs_diff=float(abs_diff),
         rel_diff=float(rel_diff),
         minor_tol=float(minor_tol),
-        rounding_step=rounding_step,
         z_score=float(z_score) if z_score is not None else None,
     )
 ```
@@ -329,6 +293,6 @@ def decide_disposable_income(
 ## Open questions (useful to answer before finalizing)
 - Is DI computed from *multiple* declared fields (income, housing, other debts), and do you have those components?
 - Do you have modeled DI uncertainty (sigma/quantiles), or only a point estimate?
-- What does “rounding” look like in your market (nearest 10/50/100/1000)?
+- How noisy are declared figures in your market (typical absolute/relative error)?
 - Can the front-end show a range/“up to X” vs a single limit?
 
